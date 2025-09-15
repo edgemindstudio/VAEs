@@ -1,0 +1,32 @@
+# config.yaml
+
+SEED: 42
+DATA_DIR: USTC-TFC2016_malware   # folder containing train_data.npy, train_labels.npy, test_data.npy, test_labels.npy
+IMG_SHAPE: [40, 40, 1]
+NUM_CLASSES: 9
+LATENT_DIM: 100
+EPOCHS: 5
+BATCH_SIZE: 256
+VAL_FRACTION: 0.5
+FID_CAP: 200
+SAMPLES_PER_CLASS: 25
+LR: 0.0002
+#BETA_1: 0.5
+BATCH_SIZE: 64
+
+BETA_1: 0.9           # (Adam)
+BETA_KL: 1.0          # β-VAE weight on KL term
+RECON_LOSS: "bce"     # or "mse"
+
+# ---- VAE regularization (Phase 2) ----
+BETA_KL_START: 0.0        # begin with no KL pressure
+BETA_KL_END: 1.0          # ramp up to the standard ELBO
+BETA_KL_WARMUP_EPOCHS: 15 # linear ramp over first N epochs
+FREE_NATS: 2.0            # allow 2 nats "free" before KL is charged
+#RECON_LOSS: "bce_logits"  # or "mse" if you train in [-1,1] with tanh
+
+ARTIFACTS:
+  checkpoints: artifacts/vae/checkpoints
+  synthetic:   artifacts/vae/synthetic
+  summaries:   artifacts/vae/summaries
+  tensorboard: artifacts/tensorboard
