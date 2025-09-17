@@ -1,37 +1,20 @@
 # vae/sample.py
+
 """
-Sampling utilities for the Conditional VAE (cVAE).
+Sampling utilities + unified-CLI synth entrypoint for the Conditional VAE (cVAE).
 
 What this provides
 ------------------
-- Rebuilds the decoder architecture via `vae.models.build_models(...)` and (optionally)
-  loads weights from a checkpoint.
-- Generates synthetic samples in two convenient modes:
-    * Balanced: N samples per class
-    * Custom: arbitrary counts per class and/or class subset
-- Saves per-class `.npy` arrays for traceability, plus combined `x_synth.npy` / `y_synth.npy`.
-- Optionally saves a quick preview grid `.png`.
-- Ships a helper `save_grid_from_decoder(...)` that your training script can call
-  to snapshot a grid during/after training.
+- Rebuild decoder via `vae.models.build_models(...)` and (optionally) load weights.
+- Generate synthetic samples either via:
+    * Standalone CLI (balanced / custom counts, optional preview grid), or
+    * Unified Orchestrator: `synth(cfg, output_root, seed)` → PNGs + manifest.
+- Saves per-class `.npy` (optional in CLI) and combined `x_synth.npy` / `y_synth.npy`.
 
 Conventions
 -----------
-- Decoder outputs are assumed in [-1, 1] (tanh). We rescale to [0, 1] before saving.
-- `config.yaml` should define: IMG_SHAPE, NUM_CLASSES, LATENT_DIM (with sensible defaults).
-
-Examples
---------
-# 1) Balanced generation: 1,000 per class into default artifacts dir
-python -m vae.sample --samples-per-class 1000
-
-# 2) Total 5,000 samples, evenly split across classes 0,1,3 only
-python -m vae.sample --num-samples 5000 --balanced --classes 0 1 3
-
-# 3) Explicit per-class counts
-python -m vae.sample --per-class 0:100 2:50 7:250
-
-# 4) Use specific weights and write a 1×12 grid
-python -m vae.sample --weights artifacts/vae/checkpoints/D_best.weights.h5 --grid 1 12
+- Decoder outputs tanh in [-1, 1]; we rescale to [0, 1] for saving/PNGs.
+- Config keys supported (with fallbacks): IMG_SHAPE, NUM_CLASSES, LATENT_DIM, LR, BETA_1, BETA_KL.
 """
 
 from __future__ import annotations
@@ -41,11 +24,12 @@ import json
 import math
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from PIL import Image
 
 from vae.models import build_models
 
@@ -57,6 +41,7 @@ def set_seeds(seed: int = 42) -> None:
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
+
 def enable_gpu_memory_growth() -> None:
     for g in tf.config.list_physical_devices("GPU"):
         try:
@@ -64,11 +49,14 @@ def enable_gpu_memory_growth() -> None:
         except Exception:
             pass
 
+
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def log(msg: str) -> None:
     print(f"[{now_ts()}] {msg}")
+
 
 def ensure_artifact_dirs(root: Path) -> None:
     (root / "artifacts" / "vae" / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -77,54 +65,43 @@ def ensure_artifact_dirs(root: Path) -> None:
     (root / "artifacts" / "tensorboard").mkdir(parents=True, exist_ok=True)
 
 
-# -----------------------------
-# CLI parsing helpers
-# -----------------------------
-def parse_per_class(entries: list[str]) -> dict[int, int]:
-    """
-    Parse items like ["0:100", "3:50"] -> {0:100, 3:50}
-    """
-    out: dict[int, int] = {}
-    for item in entries:
-        try:
-            k_str, v_str = item.split(":")
-            k, v = int(k_str), int(v_str)
-            if v <= 0:
-                raise ValueError
-            out[k] = v
-        except Exception:
-            raise argparse.ArgumentTypeError(
-                f"Invalid --per-class entry '{item}'. Use 'label:count' with positive count."
-            )
-    return out
-
-def parse_classes(entries: list[str]) -> list[int]:
-    try:
-        return [int(x) for x in entries]
-    except Exception:
-        raise argparse.ArgumentTypeError("Invalid --classes entry; must be integers.")
+def _cfg_get(cfg: dict, dotted: str, default=None):
+    cur = cfg
+    for key in dotted.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
 
 
 # -----------------------------
-# Latent + image helpers
+# Image I/O helpers
 # -----------------------------
-def sample_latents(n: int, dim: int, truncation: float | None = None) -> np.ndarray:
-    """
-    Sample latent vectors z ~ N(0, I). If `truncation` is provided, clip values to [-t, t].
-    """
-    z = np.random.normal(0.0, 1.0, size=(n, dim)).astype(np.float32)
-    if truncation is not None and truncation > 0:
-        t = float(truncation)
-        z = np.clip(z, -t, t)
-    return z
+def _to_uint8(img01: np.ndarray) -> np.ndarray:
+    return np.clip(np.round(img01 * 255.0), 0, 255).astype(np.uint8)
+
+
+def _save_png(img01: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    x = img01
+    if x.ndim == 3 and x.shape[-1] == 1:
+        x = x[..., 0]
+        mode = "L"
+    elif x.ndim == 3 and x.shape[-1] == 3:
+        mode = "RGB"
+    else:
+        x = x.squeeze()
+        mode = "L"
+    Image.fromarray(_to_uint8(x), mode=mode).save(out_path)
+
 
 def save_grid(
     images01: np.ndarray,
-    img_shape: tuple[int, int, int],
+    img_shape: Tuple[int, int, int],
     rows: int,
     cols: int,
     out_path: Path,
-    titles: list[str] | None = None,
+    titles: List[str] | None = None,
 ) -> None:
     """
     Save a grid of images in [0,1]. Supports 1 or 3 channels.
@@ -155,7 +132,7 @@ def build_and_load_decoder(
     *,
     latent_dim: int,
     num_classes: int,
-    img_shape: tuple[int, int, int],
+    img_shape: Tuple[int, int, int],
     weights_path: Optional[Path],
     lr: float = 2e-4,
     beta_1: float = 0.5,
@@ -172,73 +149,133 @@ def build_and_load_decoder(
         beta_1=beta_1,
         beta_kl=beta_kl,
     )
-    D = mdict["decoder"]
+    dec = mdict["decoder"]
 
     if weights_path is not None and weights_path.exists():
-        D.load_weights(str(weights_path))
+        dec.load_weights(str(weights_path))
         log(f"Loaded decoder weights: {weights_path}")
     else:
         if weights_path is not None:
-            log(f"WARNING: weights not found at {weights_path}. Proceeding with untrained decoder.")
+            log(f"[warn] weights not found at {weights_path}. Using untrained decoder.")
         else:
-            log("WARNING: no weights path provided. Proceeding with untrained decoder.")
-    return D
+            log("[warn] no weights path provided. Using untrained decoder.")
+    return dec
 
 
 # -----------------------------
-# Main sampling logic
+# Latent helpers & generation
 # -----------------------------
-def generate_for_classes(
-    *,
-    decoder: tf.keras.Model,
-    latent_dim: int,
-    img_shape: tuple[int, int, int],
-    class_counts: dict[int, int],
-    num_classes: int,
-    save_dir: Path,
-    save_per_class_npy: bool = True,
-    truncation: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+def sample_latents(n: int, dim: int, truncation: float | None = None) -> np.ndarray:
     """
-    Generate per-class images and return concatenated arrays:
-        x_synth_01: (N, H, W, C) in [0,1]
-        y_synth_oh: (N, num_classes) one-hot
-    Also optionally saves per-class .npy dumps for traceability.
+    Sample z ~ N(0, I). If `truncation` is provided, clip values to [-t, t].
     """
-    H, W, C = img_shape
-    xs, ys = [], []
+    z = np.random.normal(0.0, 1.0, size=(n, dim)).astype(np.float32)
+    if truncation is not None and truncation > 0:
+        t = float(truncation)
+        z = np.clip(z, -t, t)
+    return z
 
-    for cls, count in class_counts.items():
-        if cls < 0 or cls >= num_classes:
-            raise ValueError(f"Class {cls} is out of range [0, {num_classes-1}]")
-        if count <= 0:
-            continue
 
-        z = sample_latents(count, latent_dim, truncation=truncation)
-        y = tf.keras.utils.to_categorical(np.full((count,), cls), num_classes).astype(np.float32)
-
-        g = decoder.predict([z, y], verbose=0)          # expected in [-1, 1]
-        g01 = np.clip((g + 1.0) / 2.0, 0.0, 1.0)        # -> [0,1]
-
-        xs.append(g01.reshape(-1, H, W, C))
-        ys.append(y)
-
-        if save_per_class_npy:
-            np.save(save_dir / f"gen_class_{cls}.npy", g01)
-            np.save(save_dir / f"labels_class_{cls}.npy", np.full((count,), cls, dtype=np.int32))
-            log(f"Saved class {cls} -> {count} samples to {save_dir}")
-
-    if not xs:
-        return np.empty((0, H, W, C), dtype=np.float32), np.empty((0, num_classes), dtype=np.float32)
-
-    x_synth = np.concatenate(xs, axis=0)
-    y_synth = np.concatenate(ys, axis=0)
-    return x_synth, y_synth
+def _decode_to_01(decoder: tf.keras.Model, z: np.ndarray, y_onehot: np.ndarray) -> np.ndarray:
+    """
+    Decoder outputs tanh in [-1,1]; rescale to [0,1].
+    """
+    g = decoder.predict([z, y_onehot], verbose=0)   # [-1,1]
+    return np.clip((g + 1.0) / 2.0, 0.0, 1.0)
 
 
 # -----------------------------
-# Public helper used by app/main.py
+# Unified Orchestrator entrypoint
 # -----------------------------
+def synth(cfg: dict, output_root: str, seed: int = 42) -> Dict:
+    """
+    Generate S PNGs/class into {output_root}/{class}/{seed}/... and return a manifest.
+
+    Expects (optionally) a decoder checkpoint at:
+      artifacts/vae/checkpoints/D_best.weights.h5
+    """
+    # Resolve shapes & counts (support legacy spellings)
+    H, W, C = tuple(_cfg_get(cfg, "IMG_SHAPE", _cfg_get(cfg, "img.shape", (40, 40, 1))))
+    K = int(_cfg_get(cfg, "NUM_CLASSES", _cfg_get(cfg, "num_classes", 9)))
+    LATENT_DIM = int(_cfg_get(cfg, "LATENT_DIM", _cfg_get(cfg, "vae.latent_dim", 100)))
+    S = int(_cfg_get(cfg, "SAMPLES_PER_CLASS", _cfg_get(cfg, "samples_per_class", 25)))
+    LR = float(_cfg_get(cfg, "LR", _cfg_get(cfg, "vae.lr", 2e-4)))
+    BETA_1 = float(_cfg_get(cfg, "BETA_1", _cfg_get(cfg, "vae.beta_1", 0.5)))
+    BETA_KL = float(_cfg_get(cfg, "BETA_KL", _cfg_get(cfg, "vae.beta_kl", 1.0)))
+
+    artifacts_root = Path(_cfg_get(cfg, "paths.artifacts", "artifacts"))
+    default_weights = artifacts_root / "vae" / "checkpoints" / "D_best.weights.h5"
+    weights_path = Path(_cfg_get(cfg, "ARTIFACTS.vae_decoder_weights", str(default_weights)))
+
+    set_seeds(int(seed))
+    tf.keras.utils.set_random_seed(int(seed))
+
+    # Build + (optionally) load decoder
+    decoder = build_and_load_decoder(
+        latent_dim=LATENT_DIM,
+        num_classes=K,
+        img_shape=(H, W, C),
+        weights_path=weights_path if Path(weights_path).exists() else None,
+        lr=LR,
+        beta_1=BETA_1,
+        beta_kl=BETA_KL,
+    )
+
+    out_root = Path(output_root)
+    per_class_counts: Dict[str, int] = {str(k): 0 for k in range(K)}
+    paths: List[Dict] = []
+
+    # Generate per class
+    for k in range(K):
+        z = sample_latents(S, LATENT_DIM)
+        y = tf.keras.utils.to_categorical(np.full((S,), k), num_classes=K).astype(np.float32)
+        imgs01 = _decode_to_01(decoder, z, y)  # (S, H, W, C)
+
+        cls_dir = out_root / str(k) / str(seed)
+        cls_dir.mkdir(parents=True, exist_ok=True)
+        for j in range(S):
+            p = cls_dir / f"vae_{j:05d}.png"
+            _save_png(imgs01[j], p)
+            paths.append({"path": str(p), "label": int(k)})
+        per_class_counts[str(k)] = int(S)
+
+    manifest = {
+        "dataset": _cfg_get(cfg, "data.root", _cfg_get(cfg, "DATA_DIR", "data")),
+        "seed": int(seed),
+        "per_class_counts": per_class_counts,
+        "paths": paths,
+        "created_at": now_ts(),
+    }
+    return manifest
+
+
+# -----------------------------
+# Standalone generation used directly via CLI
+# -----------------------------
+def parse_per_class(entries: List[str]) -> Dict[int, int]:
+    """Parse items like ['0:100', '3:50'] -> {0:100, 3:50}."""
+    out: Dict[int, int] = {}
+    for item in entries:
+        try:
+            k_str, v_str = item.split(":")
+            k, v = int(k_str), int(v_str)
+            if v <= 0:
+                raise ValueError
+            out[k] = v
+        except Exception:
+            raise argparse.ArgumentTypeError(
+                f"Invalid --per-class entry '{item}'. Use 'label:count' with positive count."
+            )
+    return out
+
+
+def parse_classes(entries: List[str]) -> List[int]:
+    try:
+        return [int(x) for x in entries]
+    except Exception:
+        raise argparse.ArgumentTypeError("Invalid --classes entry; must be integers.")
+
+
 def save_grid_from_decoder(
     decoder: tf.keras.Model,
     num_classes: int,
@@ -248,27 +285,18 @@ def save_grid_from_decoder(
     path: Optional[Path | str] = None,
     per_class: bool = True,
     seed: int = 42,
-    conditional: bool = True,  # kept for API symmetry; decoder is conditional here
 ) -> Path:
     """
     Generate a 1×n preview from a conditional decoder and save to disk.
-
-    - Assumes decoder outputs [-1, 1]; rescales to [0, 1].
-    - Reuses `save_grid(images01, img_shape, rows, cols, out_path, titles)`.
     """
     rng = np.random.default_rng(seed)
     n = int(max(1, n))
 
-    # sample noise
     z = rng.normal(0.0, 1.0, size=(n, latent_dim)).astype(np.float32)
-
-    # choose labels
     labels = (np.arange(n) % num_classes) if per_class else rng.integers(0, num_classes, size=n)
     y = tf.keras.utils.to_categorical(labels, num_classes=num_classes).astype(np.float32)
 
-    # decode [-1,1] -> [0,1]
-    imgs = decoder.predict([z, y], verbose=0)
-    imgs01 = np.clip((imgs + 1.0) / 2.0, 0.0, 1.0)
+    imgs01 = _decode_to_01(decoder, z, y)
 
     out_path = Path(path) if path is not None else Path("preview.png")
     save_grid(
@@ -282,9 +310,6 @@ def save_grid_from_decoder(
     return out_path
 
 
-# -----------------------------
-# CLI
-# -----------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Sample synthetic data from a trained Conditional VAE decoder.")
     ap.add_argument("--config", type=str,
@@ -387,25 +412,31 @@ def main(argv=None) -> int:
                     raise ValueError("num-samples too small for the number of selected classes.")
                 class_counts = {c: per for c in selected}
             else:
-                raise ValueError("When using --num-samples, you must pass --balanced or a single class via --classes.")
+                raise ValueError("When using --num-samples, pass --balanced or a single class via --classes.")
         else:
-            # default: 1,000 per class across all classes
             class_counts = {c: 1000 for c in selected}
             log("No counts provided; defaulting to 1000 per class.")
 
     log(f"Sampling plan: {class_counts}")
 
-    # Generate
-    x_synth, y_synth = generate_for_classes(
-        decoder=D,
-        latent_dim=LATENT_DIM,
-        img_shape=IMG_SHAPE,
-        class_counts=class_counts,
-        num_classes=NUM_CLASSES,
-        save_dir=samples_dir,
-        save_per_class_npy=not args.no_save_per_class,
-        truncation=args.truncation,
-    )
+    # Generate & (optionally) save per-class npy
+    xs, ys = [], []
+    H, W, C = IMG_SHAPE
+    for cls, count in class_counts.items():
+        z = sample_latents(count, LATENT_DIM, truncation=args.truncation)
+        y = tf.keras.utils.to_categorical(np.full((count,), cls), NUM_CLASSES).astype(np.float32)
+        g01 = _decode_to_01(D, z, y)
+
+        xs.append(g01.reshape(-1, H, W, C))
+        ys.append(y)
+
+        if not args.no_save_per_class:
+            np.save(samples_dir / f"gen_class_{cls}.npy", g01)
+            np.save(samples_dir / f"labels_class_{cls}.npy", np.full((count,), cls, dtype=np.int32))
+            log(f"Saved class {cls} -> {count} samples to {samples_dir}")
+
+    x_synth = np.concatenate(xs, axis=0) if xs else np.empty((0, H, W, C), dtype=np.float32)
+    y_synth = np.concatenate(ys, axis=0) if ys else np.empty((0, NUM_CLASSES), dtype=np.float32)
     log(f"Generated synthetic arrays: x {x_synth.shape}, y {y_synth.shape}")
 
     # Save combined arrays
@@ -447,6 +478,9 @@ def main(argv=None) -> int:
 
     log("Done.")
     return 0
+
+
+__all__ = ["build_and_load_decoder", "save_grid_from_decoder", "synth"]
 
 
 if __name__ == "__main__":

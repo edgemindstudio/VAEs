@@ -1,4 +1,5 @@
 # vae/train.py
+
 """
 Train the Conditional VAE (cVAE) and save checkpoints + a small preview grid.
 
@@ -39,6 +40,7 @@ ARTIFACTS:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -49,7 +51,6 @@ import yaml
 # Ensure sibling packages are importable (vae/, eval/, etc.)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
-    import sys
     sys.path.insert(0, str(ROOT))
 
 from vae.pipeline import VAEPipeline
@@ -63,9 +64,11 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
+
 def load_yaml(path: Path) -> Dict:
     with open(path, "r") as f:
         return yaml.safe_load(f) or {}
+
 
 def ensure_dirs(cfg: Dict) -> None:
     arts = cfg.get("ARTIFACTS", {})
@@ -74,10 +77,12 @@ def ensure_dirs(cfg: Dict) -> None:
         if p:
             Path(p).mkdir(parents=True, exist_ok=True)
 
+
 def one_hot(y: np.ndarray, num_classes: int) -> np.ndarray:
     if y.ndim == 2 and y.shape[1] == num_classes:
-        return y
-    return tf.keras.utils.to_categorical(y.astype(int), num_classes=num_classes)
+        return y.astype("float32", copy=False)
+    return tf.keras.utils.to_categorical(y.astype(int), num_classes=num_classes).astype("float32", copy=False)
+
 
 def load_dataset_npy(
     data_dir: Path,
@@ -92,13 +97,20 @@ def load_dataset_npy(
     Returns x in [0,1], y as one-hot, and splits provided test into (val, test).
     """
     H, W, C = img_shape
-    x_train = np.load(data_dir / "train_data.npy")
-    y_train = np.load(data_dir / "train_labels.npy")
-    x_test  = np.load(data_dir / "test_data.npy")
-    y_test  = np.load(data_dir / "test_labels.npy")
 
-    def to_01_hwc(x):
-        x = x.astype("float32")
+    def _load(name: str) -> np.ndarray:
+        p = data_dir / name
+        if not p.exists():
+            raise FileNotFoundError(f"Missing dataset file: {p}")
+        return np.load(p)
+
+    x_train = _load("train_data.npy")
+    y_train = _load("train_labels.npy")
+    x_test  = _load("test_data.npy")
+    y_test  = _load("test_labels.npy")
+
+    def to_01_hwc(x: np.ndarray) -> np.ndarray:
+        x = x.astype("float32", copy=False)
         if x.max() > 1.5:  # if data is 0..255
             x = x / 255.0
         x = x.reshape((-1, H, W, C))
@@ -110,15 +122,17 @@ def load_dataset_npy(
     y_train = one_hot(y_train, num_classes)
     y_test  = one_hot(y_test,  num_classes)
 
-    n_val = int(len(x_test01) * val_fraction)
+    n_val = int(len(x_test01) * float(val_fraction))
     x_val01, y_val = x_test01[:n_val], y_test[:n_val]
     x_test01, y_test = x_test01[n_val:], y_test[n_val:]
 
     return x_train01, y_train, x_val01, y_val, x_test01, y_test
 
+
 def to_minus1_1(x01: np.ndarray) -> np.ndarray:
     """Map [0,1] → [-1,1] (tanh decoder convention)."""
-    return (x01 - 0.5) * 2.0
+    out = (x01 - 0.5) * 2.0
+    return np.clip(out, -1.0, 1.0)
 
 
 # ---------------------------
@@ -127,6 +141,7 @@ def to_minus1_1(x01: np.ndarray) -> np.ndarray:
 def make_log_cb(tboard_dir: Path | None):
     writer = None
     if tboard_dir:
+        tboard_dir.mkdir(parents=True, exist_ok=True)
         writer = tf.summary.create_file_writer(str(tboard_dir))
 
     def cb(epoch: int, train_loss: float, recon_loss: float, kl_loss: float, val_loss: float):
@@ -141,6 +156,7 @@ def make_log_cb(tboard_dir: Path | None):
                 tf.summary.scalar("loss/train_kl",    kl_loss,    step=epoch)
                 tf.summary.scalar("loss/val_total",   val_loss,   step=epoch)
                 writer.flush()
+
     return cb
 
 
@@ -167,6 +183,7 @@ def main() -> None:
     # Sensible defaults
     cfg.setdefault("SEED", 42)
     cfg.setdefault("VAL_FRACTION", 0.5)
+    cfg.setdefault("LATENT_DIM", 100)
     cfg.setdefault("ARTIFACTS", {})
     cfg["ARTIFACTS"].setdefault("checkpoints", "artifacts/vae/checkpoints")
     cfg["ARTIFACTS"].setdefault("synthetic",   "artifacts/vae/synthetic")
